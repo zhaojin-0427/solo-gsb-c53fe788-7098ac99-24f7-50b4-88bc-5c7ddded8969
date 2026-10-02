@@ -295,69 +295,115 @@ class Registry:
             return self.db.list_tags(repo)
 
     # ---------------- 垃圾回收 ----------------
+    #
+    # 两阶段复核：
+    #   dry-run  -> 快照候选清单并持久化为 plan（plan_id），只出报告不删除；
+    #   execute  -> 必须携带 dry-run 返回的 plan_id；执行时在同一把锁内
+    #               重算可达性/租约，只删除“计划内且仍符合条件”的对象。
+    # 这样 dry-run 之后新产生的垃圾（如标签移动刚制造的不可达对象）不在计划内，
+    # 绝不会被未审阅地删除；重新可达或续租的对象自动跳过。
 
-    def gc(self, dry_run: bool = True, grace_seconds: "int | None" = None) -> dict:
-        """可达性 GC。
+    PLAN_TTL_SECONDS = 3600              # 计划生成后 1 小时内有效
+    EXECUTED_PLAN_RETENTION_SECONDS = 7 * 24 * 3600
+    EXPIRED_PLAN_RETENTION_SECONDS = 30 * 24 * 3600
 
-        根集合：所有 tag 指向的 manifest；未过期上传租约保护其会话不被回收。
-        manifest 图沿 config/layers（blob）与 manifests[]/subject（manifest）遍历。
-        未被任何 tag 可达的 manifest、未被可达 manifest 引用且超出宽限期的 blob、
-        已过期的上传会话，进入回收清单。dry_run=True 只生成报告不删除。
-        """
+    def _reachable_sets(self) -> "tuple[set, set]":
+        """以所有 tag 为根遍历 manifest 图，返回 (可达 manifest 键集, 可达 blob 集)。"""
+        reachable_manifests: set = set()
+        reachable_blobs: set = set()
+        stack = [(t["repo"], t["digest"]) for t in self.db.all_tags()]
+        while stack:
+            key = stack.pop()
+            if key in reachable_manifests:
+                continue
+            row = self.db.get_manifest_by_digest(*key)
+            if row is None:
+                continue
+            reachable_manifests.add(key)
+            try:
+                blobs, children, _ = parse_manifest_refs(row["content"])
+            except (ValueError, UnicodeDecodeError):
+                continue  # 发布时已校验，理论上不会到这里
+            reachable_blobs.update(blobs)
+            stack.extend((key[0], c) for c in children)
+        return reachable_manifests, reachable_blobs
+
+    def _collect_candidates(self, now: float, grace: int) -> dict:
+        """在当前状态下计算 GC 候选与受保护对象（调用方持锁）。"""
+        reachable_manifests, reachable_blobs = self._reachable_sets()
+
+        dead_manifests = [
+            m for m in self.db.all_manifests()
+            if (m["repo"], m["digest"]) not in reachable_manifests
+        ]
+
+        grace_cutoff = now - grace
+        dead_blobs, grace_protected = [], []
+        for b in self.db.all_blobs():
+            if b["digest"] in reachable_blobs:
+                continue
+            (grace_protected if b["created_at"] > grace_cutoff else dead_blobs).append(b)
+
+        active_uploads = self.db.list_uploads(state="active")
+        expired_uploads = [u for u in active_uploads if u["expires_at"] <= now]
+        leased_uploads = [u for u in active_uploads if u["expires_at"] > now]
+
+        return {
+            "reachable_manifests": reachable_manifests,
+            "reachable_blobs": reachable_blobs,
+            "dead_blobs": dead_blobs,
+            "grace_protected": grace_protected,
+            "dead_manifests": dead_manifests,
+            "expired_uploads": expired_uploads,
+            "leased_uploads": leased_uploads,
+        }
+
+    def gc_dry_run(self, grace_seconds: "int | None" = None) -> dict:
+        """生成复核计划：候选快照持久化（重启有效），不删除任何数据。"""
         grace = self.settings.gc_grace_seconds if grace_seconds is None else grace_seconds
+        if grace < 0:
+            raise E.gc_invalid_request(
+                "grace_seconds must be >= 0", {"grace_seconds": grace}
+            )
         with self.lock:
             now = time.time()
-
-            reachable_manifests: set = set()
-            reachable_blobs: set = set()
-            stack = [(t["repo"], t["digest"]) for t in self.db.all_tags()]
-            while stack:
-                key = stack.pop()
-                if key in reachable_manifests:
-                    continue
-                row = self.db.get_manifest_by_digest(*key)
-                if row is None:
-                    continue
-                reachable_manifests.add(key)
-                try:
-                    blobs, children, _ = parse_manifest_refs(row["content"])
-                except (ValueError, UnicodeDecodeError):
-                    continue  # 发布时已校验，理论上不会到这里
-                reachable_blobs.update(blobs)
-                stack.extend((key[0], c) for c in children)
-
-            dead_manifests = [
-                m for m in self.db.all_manifests()
-                if (m["repo"], m["digest"]) not in reachable_manifests
-            ]
-
-            grace_cutoff = now - grace
-            dead_blobs, grace_protected = [], []
-            for b in self.db.all_blobs():
-                if b["digest"] in reachable_blobs:
-                    continue
-                (grace_protected if b["created_at"] > grace_cutoff else dead_blobs).append(b)
-
-            active_uploads = self.db.list_uploads(state="active")
-            expired_uploads = [u for u in active_uploads if u["expires_at"] <= now]
-            leased_uploads = [u for u in active_uploads if u["expires_at"] > now]
-
+            cand = self._collect_candidates(now, grace)
+            dead_blobs, dead_manifests = cand["dead_blobs"], cand["dead_manifests"]
+            expired_uploads = cand["expired_uploads"]
             repos_map = self.db.repos_for_blobs([b["digest"] for b in dead_blobs])
-            report = {
-                "dry_run": dry_run,
-                "executed": not dry_run,
+
+            plan_id = uuid.uuid4().hex
+            self.db.prune_gc_plans(
+                executed_before=now - self.EXECUTED_PLAN_RETENTION_SECONDS,
+                pending_before=now - self.EXPIRED_PLAN_RETENTION_SECONDS,
+            )
+            self.db.create_gc_plan(
+                plan_id, grace, now, self.PLAN_TTL_SECONDS,
+                blobs=[{"digest": b["digest"], "size": b["size"],
+                        "repos": sorted(repos_map.get(b["digest"], []))}
+                       for b in dead_blobs],
+                manifests=[{"repo": m["repo"], "digest": m["digest"],
+                            "media_type": m["media_type"]} for m in dead_manifests],
+                uploads=[u["id"] for u in expired_uploads],
+            )
+
+            return {
+                "dry_run": True,
+                "executed": False,
+                "plan_id": plan_id,
                 "grace_seconds": grace,
                 "generated_at": _iso(now),
+                "expires_at": _iso(now + self.PLAN_TTL_SECONDS),
                 "summary": {
                     "blobs_to_delete": len(dead_blobs),
                     "manifests_to_delete": len(dead_manifests),
                     "uploads_to_delete": len(expired_uploads),
                     "bytes_to_reclaim": sum(b["size"] for b in dead_blobs)
                     + sum(u["size"] for u in expired_uploads),
-                    "manifests_reachable": len(reachable_manifests),
-                    "blobs_reachable": len(reachable_blobs),
-                    "blobs_kept_by_grace": len(grace_protected),
-                    "uploads_kept_by_lease": len(leased_uploads),
+                    "manifests_reachable": len(cand["reachable_manifests"]),
+                    "blobs_reachable": len(cand["reachable_blobs"]),
+                    "blobs_kept_by_grace": len(cand["grace_protected"]),
+                    "uploads_kept_by_lease": len(cand["leased_uploads"]),
                 },
                 "delete": {
                     "blobs": [
@@ -369,7 +415,8 @@ class Registry:
                     "manifests": [
                         {"repo": m["repo"], "digest": m["digest"],
                          "media_type": m["media_type"], "reason": "untagged"}
-                        for m in sorted(dead_manifests, key=lambda x: (x["repo"], x["digest"]))
+                        for m in sorted(dead_manifests,
+                                        key=lambda x: (x["repo"], x["digest"]))
                     ],
                     "uploads": [
                         {"id": u["id"], "repo": u["repo"], "size": u["size"],
@@ -381,25 +428,149 @@ class Registry:
                     "blobs_grace_protected": [
                         {"digest": b["digest"], "size": b["size"],
                          "age_seconds": round(now - b["created_at"], 3)}
-                        for b in sorted(grace_protected, key=lambda x: x["digest"])
+                        for b in sorted(cand["grace_protected"],
+                                        key=lambda x: x["digest"])
                     ],
                     "uploads_leased": [
                         {"id": u["id"], "repo": u["repo"], "size": u["size"],
                          "expires_at": _iso(u["expires_at"])}
-                        for u in sorted(leased_uploads, key=lambda x: x["id"])
+                        for u in sorted(cand["leased_uploads"], key=lambda x: x["id"])
                     ],
                 },
             }
 
-            if not dry_run:
-                for u in expired_uploads:
-                    self.storage.delete_upload_file(u["id"])
-                    self.db.delete_upload(u["id"])
-                self.db.delete_manifests(
-                    [(m["repo"], m["digest"]) for m in dead_manifests]
+    def gc_execute(self, plan_id: "str | None") -> dict:
+        """按已复核计划执行 GC。
+
+        拒绝条件（不删任何数据）：plan_id 缺失、未知、生成已超过 1 小时、已执行。
+        执行时在锁内以计划记录的宽限期重算可达性与租约：只删除计划内仍符合
+        条件的对象；计划外的新候选、重新可达或续租的对象一律跳过。
+        """
+        if not plan_id or not isinstance(plan_id, str) or not plan_id.strip():
+            raise E.gc_plan_required()
+        plan_id = plan_id.strip()
+        with self.lock:
+            plan = self.db.get_gc_plan(plan_id)
+            if plan is None:
+                raise E.gc_plan_unknown(plan_id)
+            if plan["state"] == "executed":
+                raise E.gc_plan_already_executed(
+                    plan_id, _iso(plan["executed_at"]) if plan["executed_at"] else None
                 )
-                digests = [b["digest"] for b in dead_blobs]
-                self.db.delete_blobs(digests)  # 先清元数据……
-                for d in digests:
-                    self.storage.delete_blob(d)  # ……再删文件；崩溃残留由启动时 sweep 兜底
-            return report
+            now = time.time()
+            if plan["expires_at"] <= now:
+                raise E.gc_plan_expired(plan_id, _iso(plan["expires_at"]))
+
+            grace = plan["grace_seconds"]
+            grace_cutoff = now - grace
+            reachable_manifests, reachable_blobs = self._reachable_sets()
+
+            # ---- 逐候选复核：只认计划内对象的当前状态 ----
+            plan_blobs = self.db.get_gc_plan_blobs(plan_id)
+            plan_manifests = self.db.get_gc_plan_manifests(plan_id)
+            plan_upload_ids = self.db.get_gc_plan_uploads(plan_id)
+
+            delete_blobs, skip_blobs = [], []
+            for entry in sorted(plan_blobs, key=lambda x: x["digest"]):
+                digest = entry["digest"]
+                row = self.db.get_blob(digest)
+                if row is None:
+                    skip_blobs.append({"digest": digest,
+                                       "reason": "no longer present"})
+                elif digest in reachable_blobs:
+                    skip_blobs.append({"digest": digest,
+                                       "reason": "reachable again: referenced by a"
+                                                 " tagged manifest"})
+                elif row["created_at"] > grace_cutoff:
+                    skip_blobs.append({"digest": digest,
+                                       "reason": "within grace period again"})
+                else:
+                    delete_blobs.append({"digest": digest, "size": row["size"]})
+
+            delete_manifests, skip_manifests = [], []
+            for m in sorted(plan_manifests, key=lambda x: (x["repo"], x["digest"])):
+                key = (m["repo"], m["digest"])
+                row = self.db.get_manifest_by_digest(*key)
+                if row is None:
+                    skip_manifests.append({"repo": key[0], "digest": key[1],
+                                           "reason": "no longer present"})
+                elif key in reachable_manifests:
+                    skip_manifests.append({"repo": key[0], "digest": key[1],
+                                           "reason": "reachable again: a tag (or a"
+                                                     " tagged parent) points to it"})
+                else:
+                    delete_manifests.append({"repo": key[0], "digest": key[1],
+                                             "media_type": m["media_type"]})
+
+            delete_uploads, skip_uploads = [], []
+            for upload_id in sorted(plan_upload_ids):
+                u = self.db.get_upload(upload_id)
+                if u is None:
+                    skip_uploads.append({"id": upload_id,
+                                         "reason": "no longer present"})
+                elif u["state"] != "active":
+                    skip_uploads.append({"id": upload_id, "repo": u["repo"],
+                                         "reason": f"upload {u['state']}"})
+                elif u["expires_at"] > now:
+                    skip_uploads.append({"id": upload_id, "repo": u["repo"],
+                                         "reason": "lease renewed or still active"})
+                else:
+                    delete_uploads.append(u)
+
+            # ---- 实际删除（先元数据后文件），全程持锁与发布/拉取互斥 ----
+            for u in delete_uploads:
+                self.storage.delete_upload_file(u["id"])
+                self.db.delete_upload(u["id"])
+            self.db.delete_manifests(
+                [(m["repo"], m["digest"]) for m in delete_manifests]
+            )
+            digests = [b["digest"] for b in delete_blobs]
+            repos_map = self.db.repos_for_blobs(digests)
+            self.db.delete_blobs(digests)
+            for d in digests:
+                self.storage.delete_blob(d)  # 崩溃残留由启动时 sweep 兜底
+
+            self.db.mark_gc_plan_executed(plan_id, now)
+
+            return {
+                "dry_run": False,
+                "executed": True,
+                "plan_id": plan_id,
+                "grace_seconds": grace,
+                "generated_at": _iso(plan["created_at"]),
+                "executed_at": _iso(now),
+                "summary": {
+                    "blobs_deleted": len(delete_blobs),
+                    "manifests_deleted": len(delete_manifests),
+                    "uploads_deleted": len(delete_uploads),
+                    "blobs_skipped": len(skip_blobs),
+                    "manifests_skipped": len(skip_manifests),
+                    "uploads_skipped": len(skip_uploads),
+                    "bytes_reclaimed": sum(b["size"] for b in delete_blobs)
+                    + sum(u["size"] for u in delete_uploads),
+                },
+                "deleted": {
+                    "blobs": [
+                        {"digest": b["digest"], "size": b["size"],
+                         "repos": sorted(repos_map.get(b["digest"], [])),
+                         "reason": "still unreferenced at execution"}
+                        for b in delete_blobs
+                    ],
+                    "manifests": [
+                        {"repo": m["repo"], "digest": m["digest"],
+                         "media_type": m["media_type"],
+                         "reason": "still untagged at execution"}
+                        for m in delete_manifests
+                    ],
+                    "uploads": [
+                        {"id": u["id"], "repo": u["repo"], "size": u["size"],
+                         "reason": "lease still expired at execution"}
+                        for u in delete_uploads
+                    ],
+                },
+                "skipped": {
+                    "blobs": skip_blobs,
+                    "manifests": skip_manifests,
+                    "uploads": skip_uploads,
+                },
+            }

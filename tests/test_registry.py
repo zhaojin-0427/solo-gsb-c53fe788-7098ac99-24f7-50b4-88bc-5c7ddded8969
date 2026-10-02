@@ -288,6 +288,8 @@ def test_gc_dry_run_then_execute(client):
     # grace_seconds=0：跳过宽限期，立刻回收无引用对象
     report = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
     assert report["dry_run"] is True
+    assert report["plan_id"]  # dry-run 返回持久化计划 ID
+    assert report["expires_at"] > report["generated_at"]
     dead_blobs = {b["digest"] for b in report["delete"]["blobs"]}
     assert digest_of(layer2) in dead_blobs
     assert digest_of(cfg_b) in dead_blobs
@@ -300,12 +302,35 @@ def test_gc_dry_run_then_execute(client):
     # dry-run 不删除任何东西
     assert client.get(f"/v2/app/blobs/{digest_of(layer2)}").status_code == 200
 
-    client.post("/gc", json={"dry_run": False, "grace_seconds": 0})
+    # 缺 plan_id 被拒绝（400）且不删数据
+    missing = client.post("/gc", json={"dry_run": False})
+    assert missing.status_code == 400
+    assert missing.json()["errors"][0]["code"] == "GC_PLAN_REQUIRED"
+    assert client.get(f"/v2/app/blobs/{digest_of(layer2)}").status_code == 200
+
+    # 执行必须携带 dry-run 返回的 plan_id；响应列出实际删除项
+    r = client.post("/gc", json={"dry_run": False, "plan_id": report["plan_id"]})
+    assert r.status_code == 200, r.text
+    result = r.json()
+    assert result["executed"] is True
+    assert result["plan_id"] == report["plan_id"]
+    assert result["summary"]["blobs_deleted"] == 2
+    assert result["summary"]["manifests_deleted"] == 1
+    assert result["summary"]["bytes_reclaimed"] > 0
+    deleted_blobs = {b["digest"] for b in result["deleted"]["blobs"]}
+    assert digest_of(layer2) in deleted_blobs
+    assert digest_of(cfg_b) in deleted_blobs
     assert client.get(f"/v2/app/blobs/{digest_of(layer2)}").status_code == 404
     assert client.get(f"/v2/app/blobs/{digest_of(shared)}").status_code == 200
     assert client.get(f"/v2/app/manifests/{digest_of(m_b)}").status_code == 404
     assert client.get("/v2/app/manifests/keep").status_code == 200
     assert client.get("/v2/app/manifests/temp").status_code == 200
+
+    # 重复执行同一计划：409 拒绝，不会再次删除
+    dup = client.post("/gc", json={"dry_run": False, "plan_id": report["plan_id"]})
+    assert dup.status_code == 409
+    assert dup.json()["errors"][0]["code"] == "GC_PLAN_ALREADY_EXECUTED"
+    assert client.get(f"/v2/app/blobs/{digest_of(shared)}").status_code == 200
 
 
 def test_gc_respects_grace_period(client):
@@ -317,7 +342,7 @@ def test_gc_respects_grace_period(client):
     report = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
     assert d in {b["digest"] for b in report["delete"]["blobs"]}
 
-    client.post("/gc", json={"dry_run": False, "grace_seconds": 0})
+    client.post("/gc", json={"dry_run": False, "plan_id": report["plan_id"]})
     assert client.get(f"/v2/app/blobs/{d}").status_code == 404
 
 
@@ -333,7 +358,7 @@ def test_gc_upload_leases(client, settings):
     assert stale in {u["id"] for u in report["delete"]["uploads"]}
     assert live in {u["id"] for u in report["keep"]["uploads_leased"]}
 
-    client.post("/gc", json={"dry_run": False})
+    client.post("/gc", json={"dry_run": False, "plan_id": report["plan_id"]})
     assert client.get(f"/v2/app/blobs/uploads/{stale}").status_code == 404
     assert client.get(f"/v2/app/blobs/uploads/{live}").status_code == 204
 
@@ -368,9 +393,14 @@ def test_gc_concurrent_pull_and_publish(client, settings):
             errors.append(exc)
 
     def collector():
+        # 每次循环生成自己的计划再执行；并发新发布/标签移动产生的新候选
+        # 不在任何计划内，绝不能被误删
         try:
             for _ in range(10):
-                client.post("/gc", json={"dry_run": False})
+                p = client.post("/gc", json={"dry_run": True}).json()
+                r = client.post("/gc", json={"dry_run": False,
+                                             "plan_id": p["plan_id"]})
+                assert r.status_code == 200, r.text
                 time.sleep(0.001)
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)
@@ -389,6 +419,190 @@ def test_gc_concurrent_pull_and_publish(client, settings):
     assert client.get("/v2/app/manifests/v9").status_code == 200
     # 垃圾已被回收
     assert client.get(f"/v2/app/blobs/{digest_of(b'garbage-old')}").status_code == 404
+
+
+# ---------------- GC 复核计划：修复 dry-run 后新增候选被误删 ----------------
+
+def _age_all_blobs(registry):
+    with registry.lock:  # 让所有 blob 老过宽限期
+        registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        registry.db._conn.commit()
+
+
+def test_gc_plan_unknown_and_bad_request(client):
+    assert client.post("/gc", json={"dry_run": False,
+                                   "plan_id": "deadbeef"}).status_code == 404
+    r = client.post("/gc", json={"dry_run": False, "plan_id": "   "})
+    assert r.status_code == 400
+    assert r.json()["errors"][0]["code"] == "GC_PLAN_REQUIRED"
+    r = client.post("/gc", json={"dry_run": True, "grace_seconds": -5})
+    assert r.status_code == 400
+    assert r.json()["errors"][0]["code"] == "GC_INVALID"
+
+
+def test_gc_new_candidates_after_dry_run_are_left_for_next_review(client):
+    """核心漏洞：dry-run 之后标签移动产生的新不可达对象不得被本次执行删除。"""
+    registry = client.app.state.registry
+
+    # dry-run 前就存在的、已被复核的垃圾
+    old_garbage = push_blob(client, "app", b"old garbage")
+    # 一张随后会被移动的标签：v1 -> m1
+    cfg1, cfg2 = b"cfg-1", b"cfg-2"
+    layer1, layer2 = b"layer-1", b"layer-2"
+    m1 = _push_image(client, "app", "v1", cfg1, [layer1])
+    _age_all_blobs(registry)
+
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    assert old_garbage in {b["digest"] for b in plan["delete"]["blobs"]}
+
+    # ---- dry-run 之后、执行之前：标签移动制造新的不可达 manifest/blob ----
+    _push_image(client, "app", "v1", cfg2, [layer2], expected=digest_of(m1))
+    # 再凭空产生一个不可达 blob（同样老过宽限期，专门用来验证“不在计划内”）
+    new_garbage = push_blob(client, "app", b"new garbage after plan")
+    _age_all_blobs(registry)
+
+    result = client.post("/gc", json={"dry_run": False,
+                                      "plan_id": plan["plan_id"]})
+    assert result.status_code == 200, result.text
+    rep = result.json()
+
+    # 只删除计划内仍符合条件的 old garbage
+    deleted = {b["digest"] for b in rep["deleted"]["blobs"]}
+    assert deleted == {old_garbage}
+    assert client.get(f"/v2/app/blobs/{old_garbage}").status_code == 404
+
+    # 标签移动新产生的不可达对象（m1 及其 cfg/layer、new_garbage）一律保留，
+    # 即使它们老过宽限期——等待下次 dry-run 审阅
+    assert client.get(f"/v2/app/blobs/{digest_of(cfg1)}").status_code == 200
+    assert client.get(f"/v2/app/blobs/{digest_of(layer1)}").status_code == 200
+    assert client.get(f"/v2/app/manifests/{digest_of(m1)}").status_code == 200
+    assert client.get(f"/v2/app/blobs/{new_garbage}").status_code == 200
+
+    # 下一次 dry-run 才把这些新候选列出来
+    next_plan = client.post("/gc", json={"dry_run": True,
+                                         "grace_seconds": 0}).json()
+    next_blob_candidates = {b["digest"] for b in next_plan["delete"]["blobs"]}
+    assert new_garbage in next_blob_candidates
+    assert digest_of(cfg1) in next_blob_candidates
+    assert digest_of(layer1) in next_blob_candidates
+    assert digest_of(m1) in {m["digest"] for m in next_plan["delete"]["manifests"]}
+
+
+def test_gc_execution_skips_blob_become_reachable_again(client):
+    registry = client.app.state.registry
+    d = push_blob(client, "app", b"will be re-referenced")
+    _age_all_blobs(registry)
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    assert d in {b["digest"] for b in plan["delete"]["blobs"]}
+
+    # 执行前发布一个带标签的 manifest 引用该 blob，使其重新可达
+    push_blob(client, "app", b"cfg")
+    _age_all_blobs(registry)
+    m = make_manifest(b"cfg", [b"will be re-referenced"])
+    push_manifest(client, "app", "v1", m)
+
+    rep = client.post("/gc", json={"dry_run": False,
+                                   "plan_id": plan["plan_id"]}).json()
+    assert rep["summary"]["blobs_deleted"] == 0
+    assert rep["summary"]["blobs_skipped"] == 1
+    assert rep["skipped"]["blobs"][0]["digest"] == d
+    assert "reachable again" in rep["skipped"]["blobs"][0]["reason"]
+    assert client.get(f"/v2/app/blobs/{d}").status_code == 200
+
+
+def test_gc_execution_skips_manifest_retagged_again(client):
+    registry = client.app.state.registry
+    cfg_a, cfg_b = b"cfg-a", b"cfg-b"
+    m_a = _push_image(client, "app", "v1", cfg_a, [])
+    _push_image(client, "app", "v1", cfg_b, [], expected=digest_of(m_a))
+    _age_all_blobs(registry)
+
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    assert digest_of(m_a) in {m["digest"] for m in plan["delete"]["manifests"]}
+
+    # 执行前把标签移回 m_a：m_a 重新可达，本次跳过
+    cur = client.get("/v2/app/manifests/v1").headers["Docker-Content-Digest"]
+    push_manifest(client, "app", "v1", m_a, expected=cur)
+
+    rep = client.post("/gc", json={"dry_run": False,
+                                   "plan_id": plan["plan_id"]}).json()
+    assert rep["summary"]["manifests_deleted"] == 0
+    assert rep["summary"]["manifests_skipped"] == 1
+    assert rep["skipped"]["manifests"][0]["digest"] == digest_of(m_a)
+    assert client.get(f"/v2/app/manifests/{digest_of(m_a)}").status_code == 200
+
+
+def test_gc_execution_skips_renewed_upload(client):
+    # 会话租约在 dry-run 时刚好到期（被列为候选），执行前被续租
+    registry = client.app.state.registry
+    near = client.post("/v2/app/blobs/uploads").headers["Docker-Upload-UUID"]
+    # 手动把到期时间放到“dry-run 之后、执行之前”之间
+    with registry.lock:
+        registry.db.update_upload_progress(near, 0, time.time() + 0.3)
+    time.sleep(0.5)  # 现在租约已过期 -> 进入 dry-run 候选
+
+    plan = client.post("/gc", json={"dry_run": True}).json()
+    assert near in {u["id"] for u in plan["delete"]["uploads"]}
+
+    # 执行前续租：模拟客户端在复核窗口内完成读写，租约被延长
+    with registry.lock:
+        registry.db.update_upload_progress(near, 0, time.time() + 3600)
+
+    rep = client.post("/gc", json={"dry_run": False,
+                                   "plan_id": plan["plan_id"]}).json()
+    assert rep["summary"]["uploads_deleted"] == 0
+    assert rep["summary"]["uploads_skipped"] == 1
+    assert rep["skipped"]["uploads"][0]["id"] == near
+    assert "renewed" in rep["skipped"]["uploads"][0]["reason"]
+    assert client.get(f"/v2/app/blobs/uploads/{near}").status_code == 204
+
+
+def test_gc_expired_plan_is_rejected_without_deleting(client):
+    registry = client.app.state.registry
+    garbage = push_blob(client, "app", b"expired plan garbage")
+    _age_all_blobs(registry)
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+
+    # 把计划的有效期改到过去（模拟生成超过 1 小时）
+    with registry.lock:
+        registry.db._conn.execute(
+            "UPDATE gc_plans SET expires_at = ? WHERE id = ?",
+            (time.time() - 1, plan["plan_id"]),
+        )
+        registry.db._conn.commit()
+
+    r = client.post("/gc", json={"dry_run": False, "plan_id": plan["plan_id"]})
+    assert r.status_code == 410
+    assert r.json()["errors"][0]["code"] == "GC_PLAN_EXPIRED"
+    # 未删除任何数据，需重新 dry-run
+    assert client.get(f"/v2/app/blobs/{garbage}").status_code == 200
+
+    new_plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    assert client.post("/gc", json={"dry_run": False,
+                                    "plan_id": new_plan["plan_id"]}).status_code == 200
+    assert client.get(f"/v2/app/blobs/{garbage}").status_code == 404
+
+
+def test_gc_plan_survives_restart_and_executes_once(settings):
+    """计划持久化在 SQLite：跨进程重启仍可执行，且只能执行一次。"""
+    c1 = TestClient(create_app(settings))
+    garbage = push_blob(c1, "app", b"plan across restart")
+    registry = c1.app.state.registry
+    with registry.lock:
+        registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        registry.db._conn.commit()
+    plan = c1.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+
+    # 重启：同一数据目录的新应用实例读取到同一份计划
+    c2 = TestClient(create_app(settings))
+    r = c2.post("/gc", json={"dry_run": False, "plan_id": plan["plan_id"]})
+    assert r.status_code == 200, r.text
+    assert c2.get(f"/v2/app/blobs/{garbage}").status_code == 404
+
+    # 重启后重复执行同样被拒绝
+    dup = c2.post("/gc", json={"dry_run": False, "plan_id": plan["plan_id"]})
+    assert dup.status_code == 409
+    assert dup.json()["errors"][0]["code"] == "GC_PLAN_ALREADY_EXECUTED"
 
 
 # ---------------- 重启恢复 ----------------

@@ -89,3 +89,44 @@ def tag_conflict(repo: str, tag: str, current: "str | None", expected: "str | No
         f"re-send with header 'If-Match: <current digest>' to move the tag",
         {"repo": repo, "tag": tag, "current": current, "expected": expected},
     )
+
+
+# ---------------- GC 复核计划 ----------------
+
+def gc_invalid_request(message: str, detail=None) -> OCIError:
+    return OCIError(400, "GC_INVALID", message, detail)
+
+
+def gc_plan_required() -> OCIError:
+    return OCIError(
+        400, "GC_PLAN_REQUIRED",
+        "execution (dry_run=false) requires the plan_id of a prior dry-run report; "
+        "run a dry-run first and re-submit the returned plan_id",
+        {"hint": "POST /gc with {\"dry_run\": true} to obtain a plan_id"},
+    )
+
+
+def gc_plan_unknown(plan_id: str) -> OCIError:
+    return OCIError(
+        404, "GC_PLAN_UNKNOWN",
+        f"unknown GC plan_id: {plan_id!r}; run a new dry-run",
+        {"plan_id": plan_id},
+    )
+
+
+def gc_plan_expired(plan_id: str, expires_at: "str | None") -> OCIError:
+    return OCIError(
+        410, "GC_PLAN_EXPIRED",
+        f"GC plan {plan_id!r} expired at {expires_at or '<unknown>'} "
+        "(plans are valid for one hour after generation); run a new dry-run",
+        {"plan_id": plan_id, "expires_at": expires_at},
+    )
+
+
+def gc_plan_already_executed(plan_id: str, executed_at: "str | None") -> OCIError:
+    return OCIError(
+        409, "GC_PLAN_ALREADY_EXECUTED",
+        f"GC plan {plan_id!r} was already executed at {executed_at or '<unknown>'}; "
+        "repeated execution deletes nothing, run a new dry-run for a new plan",
+        {"plan_id": plan_id, "executed_at": executed_at},
+    )

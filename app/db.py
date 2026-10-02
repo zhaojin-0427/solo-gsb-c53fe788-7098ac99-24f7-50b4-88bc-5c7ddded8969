@@ -8,9 +8,12 @@
 - uploads     上传会话（落盘持久化，重启后可恢复/续传）
 - manifests   repo 内按摘要不可变存储的 manifest
 - tags        repo 内 tag -> manifest digest（CAS 更新）
+- gc_plans    GC 复核计划（dry-run 快照，持久化、1h 有效、只能执行一次）
+- gc_plan_blobs / gc_plan_manifests / gc_plan_uploads  计划内候选清单
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -54,6 +57,34 @@ CREATE TABLE IF NOT EXISTS tags (
     updated_at REAL NOT NULL,
     PRIMARY KEY (repo, name)
 );
+CREATE TABLE IF NOT EXISTS gc_plans (
+    id           TEXT PRIMARY KEY,
+    state        TEXT NOT NULL,          -- pending | executed
+    grace_seconds INTEGER NOT NULL,      -- 生成时记录，执行复核以此为准
+    created_at   REAL NOT NULL,
+    expires_at   REAL NOT NULL,          -- created_at + 1h，过期计划拒绝执行
+    executed_at  REAL
+);
+CREATE TABLE IF NOT EXISTS gc_plan_blobs (
+    plan_id    TEXT NOT NULL,
+    digest     TEXT NOT NULL,
+    size       INTEGER NOT NULL,
+    repos      TEXT NOT NULL,            -- JSON 数组：候选时关联的仓库
+    PRIMARY KEY (plan_id, digest)
+);
+CREATE TABLE IF NOT EXISTS gc_plan_manifests (
+    plan_id    TEXT NOT NULL,
+    repo       TEXT NOT NULL,
+    digest     TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    PRIMARY KEY (plan_id, repo, digest)
+);
+CREATE TABLE IF NOT EXISTS gc_plan_uploads (
+    plan_id    TEXT NOT NULL,
+    upload_id  TEXT NOT NULL,
+    PRIMARY KEY (plan_id, upload_id)
+);
+CREATE INDEX IF NOT EXISTS idx_gc_plans_state_created ON gc_plans (state, created_at);
 """
 
 
@@ -261,3 +292,87 @@ class Database:
                 "SELECT name FROM tags WHERE repo = ? ORDER BY name", (repo,)
             ).fetchall()
             return [r["name"] for r in rows]
+
+    # ---------------- GC 复核计划 ----------------
+
+    def create_gc_plan(self, plan_id: str, grace_seconds: int, now: float,
+                       ttl_seconds: int, blobs: list, manifests: list,
+                       uploads: list):
+        """原子写入一份 GC 计划及其全部候选（与下次 GC 互斥，持锁调用）。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO gc_plans (id, state, grace_seconds, created_at,"
+                " expires_at, executed_at) VALUES (?, 'pending', ?, ?, ?, NULL)",
+                (plan_id, grace_seconds, now, now + ttl_seconds),
+            )
+            self._conn.executemany(
+                "INSERT INTO gc_plan_blobs (plan_id, digest, size, repos)"
+                " VALUES (?, ?, ?, ?)",
+                [(plan_id, b["digest"], b["size"], json.dumps(b["repos"]))
+                 for b in blobs],
+            )
+            self._conn.executemany(
+                "INSERT INTO gc_plan_manifests (plan_id, repo, digest, media_type)"
+                " VALUES (?, ?, ?, ?)",
+                [(plan_id, m["repo"], m["digest"], m["media_type"])
+                 for m in manifests],
+            )
+            self._conn.executemany(
+                "INSERT INTO gc_plan_uploads (plan_id, upload_id) VALUES (?, ?)",
+                [(plan_id, u) for u in uploads],
+            )
+
+    def get_gc_plan(self, plan_id: str) -> "dict | None":
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM gc_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_gc_plan_blobs(self, plan_id: str) -> list:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM gc_plan_blobs WHERE plan_id = ?", (plan_id,)
+            ).fetchall()
+            return [{"digest": r["digest"], "size": r["size"],
+                     "repos": json.loads(r["repos"])} for r in rows]
+
+    def get_gc_plan_manifests(self, plan_id: str) -> list:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM gc_plan_manifests WHERE plan_id = ?", (plan_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_gc_plan_uploads(self, plan_id: str) -> list:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT upload_id FROM gc_plan_uploads WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchall()
+            return [r["upload_id"] for r in rows]
+
+    def mark_gc_plan_executed(self, plan_id: str, now: float):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE gc_plans SET state = 'executed', executed_at = ? WHERE id = ?",
+                (now, plan_id),
+            )
+
+    def prune_gc_plans(self, executed_before: float, pending_before: float):
+        """删除历史计划（已执行且超过保留期，或早已过期仍未执行），防止表无限增长。"""
+        with self._lock, self._conn:
+            ids = [r["id"] for r in self._conn.execute(
+                "SELECT id FROM gc_plans"
+                " WHERE (state = 'executed' AND executed_at < ?)"
+                "    OR (state = 'pending' AND expires_at < ?)",
+                (executed_before, pending_before),
+            ).fetchall()]
+            if not ids:
+                return
+            marks = ",".join("?" for _ in ids)
+            for table in ("gc_plan_blobs", "gc_plan_manifests", "gc_plan_uploads"):
+                self._conn.execute(
+                    f"DELETE FROM {table} WHERE plan_id IN ({marks})", ids
+                )
+            self._conn.execute(f"DELETE FROM gc_plans WHERE id IN ({marks})", ids)
