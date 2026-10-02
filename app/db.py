@@ -8,6 +8,7 @@
 - uploads     上传会话（落盘持久化，重启后可恢复/续传）
 - manifests   repo 内按摘要不可变存储的 manifest
 - tags        repo 内 tag -> manifest digest（CAS 更新）
+- gc_plans    GC 复核计划（dry-run 持久化候选，执行凭 plan_id 认领，重启有效）
 """
 from __future__ import annotations
 
@@ -53,6 +54,15 @@ CREATE TABLE IF NOT EXISTS tags (
     digest     TEXT NOT NULL,
     updated_at REAL NOT NULL,
     PRIMARY KEY (repo, name)
+);
+CREATE TABLE IF NOT EXISTS gc_plans (
+    id         TEXT PRIMARY KEY,
+    status     TEXT NOT NULL,              -- pending | executed
+    payload    TEXT NOT NULL,              -- 生成时的候选清单（JSON，执行只允许删其中对象）
+    grace_seconds INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,             -- 超过生成后 TTL 即拒绝执行
+    executed_at REAL
 );
 """
 
@@ -261,3 +271,45 @@ class Database:
                 "SELECT name FROM tags WHERE repo = ? ORDER BY name", (repo,)
             ).fetchall()
             return [r["name"] for r in rows]
+
+    # ---------------- gc plans ----------------
+
+    def create_gc_plan(self, plan_id: str, payload: str, grace_seconds: int,
+                       now: float, expires_at: float):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO gc_plans (id, status, payload, grace_seconds,"
+                " created_at, expires_at, executed_at)"
+                " VALUES (?, 'pending', ?, ?, ?, ?, NULL)",
+                (plan_id, payload, grace_seconds, now, expires_at),
+            )
+
+    def get_gc_plan(self, plan_id: str) -> "dict | None":
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM gc_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def claim_gc_plan(self, plan_id: str, executed_at: float) -> int:
+        """原子认领：仅 pending 行可被更新为 executed，返回受影响行数（0/1）。
+
+        单进程内由 RLock 串行，跨进程时该条件更新本身即原子，
+        从而保证重复/并发执行只有一方成功，绝不重复删除。
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE gc_plans SET status = 'executed', executed_at = ?"
+                " WHERE id = ? AND status = 'pending'",
+                (executed_at, plan_id),
+            )
+            return cur.rowcount
+
+    def prune_gc_plans(self, before_ts: float):
+        """清理过期未执行计划与足够久之前已执行计划，防止表无限增长。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM gc_plans WHERE expires_at < ? OR executed_at IS NOT NULL"
+                " AND executed_at < ?",
+                (before_ts, before_ts),
+            )

@@ -15,7 +15,7 @@
 | 重启恢复 | 上传会话与进度持久化在 SQLite，重启后自动对齐磁盘实际进度，可继续续传 |
 | 不可变 manifest | digest 寻址的 manifest 内容与摘要不符即拒绝；发布时校验 config/layers/subject/子 manifest 引用必须已存在，杜绝悬空引用 |
 | 标签 CAS | 移动已存在的标签必须携带期望摘要（`If-Match` 头或 `?expected=`），不匹配返回 `409 TAG_CONFLICT` |
-| 安全 GC | 以「标签 + 未过期上传租约」为根建立可达图；默认 dry-run 生成可复核报告；宽限期保护新上传 blob；与并发拉取/发布互斥，绝不误删可达数据 |
+| 安全 GC | 以「标签 + 未过期上传租约」为根建立可达图；**两阶段复核**——dry-run 持久化候选计划并返回 `plan_id`，执行只删计划内、执行时仍不可达的对象；宽限期保护新上传 blob；与并发拉取/发布互斥，绝不误删可达数据 |
 
 ## 快速开始（Docker Compose 一键启动）
 
@@ -45,6 +45,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 5000
 | `REGISTRY_DATA_DIR` | `./data`（镜像内 `/data`） | 数据目录（SQLite + blob 文件 + 上传临时文件） |
 | `REGISTRY_UPLOAD_LEASE_SECONDS` | `3600` | 上传会话租约；超时无读写即被 GC 回收 |
 | `REGISTRY_GC_GRACE_SECONDS` | `3600` | GC 宽限期；创建不足该时长的未引用 blob 不回收，保护「已推送、待发布」窗口 |
+| `REGISTRY_GC_PLAN_TTL_SECONDS` | `3600` | GC 复核计划有效期；dry-run 生成的计划超过该时长（默认一小时）未执行即作废 |
 
 ## API 一览
 
@@ -60,7 +61,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 5000
 | PUT | `/v2/{repo}/manifests/{ref}` | 发布 manifest；`ref` 为标签时需 CAS（`If-Match` 或 `?expected=`） |
 | GET/HEAD | `/v2/{repo}/manifests/{ref}` | 拉取 manifest（`ref` 可为标签或 digest） |
 | GET | `/v2/{repo}/tags/list` | 列出标签 |
-| POST | `/gc` | 垃圾回收，body `{"dry_run": true, "grace_seconds": 3600}` |
+| POST | `/gc` | 两阶段垃圾回收。`{"dry_run": true, "grace_seconds": 3600}` 生成并持久化复核计划（返回 `plan_id`）；`{"dry_run": false, "plan_id": "..."}` 执行该计划 |
 
 错误统一为 OCI 格式：`{"errors":[{"code","message","detail"}]}`。
 
@@ -150,34 +151,146 @@ curl -s http://localhost:5000/v2/demo/app/blobs/$DIGEST -o layer.bin
 curl -s http://localhost:5000/v2/demo/app/tags/list
 ```
 
-### 4. 垃圾回收（先 dry-run 复核，再执行）
+### 4. 垃圾回收（先 dry-run 复核，再凭 plan_id 执行）
+
+GC 采用**两阶段复核**，修复了「dry-run 后状态又变化、执行时重算会删掉未审阅
+对象」的问题：dry-run 把候选清单**原样持久化**为计划，执行只允许删除计划内、
+且执行时刻仍然不可达/已过期的对象。
+
+#### 第一步：dry-run —— 生成并持久化复核计划
 
 ```bash
-# dry-run（默认）：只生成报告，不删任何数据
 curl -s -X POST -H 'Content-Type: application/json' \
-  -d '{"dry_run": true}' http://localhost:5000/gc | jq .
-
-# 报告示例（节选）：
-# {
-#   "dry_run": true,
-#   "summary": {"blobs_to_delete": 2, "manifests_to_delete": 1,
-#               "uploads_to_delete": 0, "bytes_to_reclaim": 4096, ...},
-#   "delete": {"blobs": [{"digest": "sha256:...", "size": 1024, "repos": ["demo/app"],
-#                          "reason": "unreferenced and older than grace period"}], ...},
-#   "keep":   {"blobs_grace_protected": [...], "uploads_leased": [...]}
-# }
-
-# 复核无误后执行
-curl -s -X POST -H 'Content-Type: application/json' \
-  -d '{"dry_run": false}' http://localhost:5000/gc | jq .summary
+  -d '{"dry_run": true, "grace_seconds": 0}' http://localhost:5000/gc | jq .
 ```
+
+请求体：`dry_run`（默认 `true`）、可选 `grace_seconds`（不传则用
+`REGISTRY_GC_GRACE_SECONDS`，该值会记录在计划里）。
+
+真实响应（`delete.blobs/manifests/uploads` 即本次复核记录的候选；此时不删任何数据）：
+
+```json
+{
+  "dry_run": true,
+  "plan_id": "gcplan-3a2f5c54109e42b58e0f4828485a7089",
+  "expires_at": "2026-10-02T02:29:25.708776+00:00",
+  "plan_ttl_seconds": 3600,
+  "grace_seconds": 0,
+  "generated_at": "2026-10-02T01:29:25.708776+00:00",
+  "summary": {
+    "blobs_to_delete": 2,
+    "manifests_to_delete": 1,
+    "uploads_to_delete": 0,
+    "bytes_to_reclaim": 17,
+    "manifests_reachable": 1,
+    "blobs_reachable": 1,
+    "blobs_kept_by_grace": 0,
+    "uploads_kept_by_lease": 0
+  },
+  "delete": {
+    "blobs": [
+      {"digest": "sha256:72ca7be537ce7477c009da27266088b1544644464a8751212181112899041b4b",
+       "size": 8, "repos": ["demo/app"],
+       "reason": "unreferenced and older than grace period"},
+      {"digest": "sha256:e3155b20e134632816c8611c4e9ee5cbd0e00689f7c4c955ee9f896580d02fdb",
+       "size": 9, "repos": ["demo/app"],
+       "reason": "unreferenced and older than grace period"}
+    ],
+    "manifests": [
+      {"repo": "demo/app",
+       "digest": "sha256:f299f420c1dc013ea7e1f777f6ba5c876f08960908cb61fa29da7868a0e3b1b0",
+       "media_type": "application/vnd.oci.image.manifest.v1+json", "reason": "untagged"}
+    ],
+    "uploads": []
+  },
+  "keep": {"blobs_grace_protected": [], "uploads_leased": []}
+}
+```
+
+> 复核窗口（默认 1 小时，由 `REGISTRY_GC_PLAN_TTL_SECONDS` 控制）内完成下一步。
+
+#### 第二步：执行 —— 提交 `dry_run:false` + `plan_id`
+
+```bash
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"dry_run": false, "plan_id": "gcplan-3a2f5c54109e42b58e0f4828485a7089"}' \
+  http://localhost:5000/gc | jq .
+```
+
+执行时会在写锁内、用**计划记录的宽限期**重新检查可达性和租约。真实响应分别列出
+**实际删除（`deleted`）**与**跳过（`skipped`，计划内但已重新可达/续租）**：
+
+```json
+{
+  "dry_run": false,
+  "executed": true,
+  "plan_id": "gcplan-3a2f5c54109e42b58e0f4828485a7089",
+  "grace_seconds": 0,
+  "generated_at": "2026-10-02T01:29:25.708776+00:00",
+  "executed_at": "2026-10-02T01:29:39.458406+00:00",
+  "summary": {
+    "blobs_deleted": 2,
+    "manifests_deleted": 1,
+    "uploads_deleted": 0,
+    "blobs_skipped": 0,
+    "manifests_skipped": 0,
+    "uploads_skipped": 0,
+    "bytes_reclaimed": 17
+  },
+  "deleted": {
+    "blobs": [
+      {"digest": "sha256:72ca7be537ce7477c009da27266088b1544644464a8751212181112899041b4b",
+       "size": 8, "repos": ["demo/app"]},
+      {"digest": "sha256:e3155b20e134632816c8611c4e9ee5cbd0e00689f7c4c955ee9f896580d02fdb",
+       "size": 9, "repos": ["demo/app"]}
+    ],
+    "manifests": [
+      {"repo": "demo/app",
+       "digest": "sha256:f299f420c1dc013ea7e1f777f6ba5c876f08960908cb61fa29da7868a0e3b1b0"}
+    ],
+    "uploads": []
+  },
+  "skipped": {"blobs": [], "manifests": [], "uploads": []}
+}
+```
+
+对象在复核后被标签重新引用或上传被续租时，会出现在 `skipped` 中，reason 为
+`reachable again`、`reachable again (tag moved back)`、`lease renewed`、
+`blob no longer exists` 等；dry-run 之后**新产生**的不可达对象不在计划内，本轮
+一律保留，留待下一次 dry-run 审阅。
+
+#### 拒绝执行的情况（一律不删数据）
+
+| 场景 | 状态码 | `errors[0].code` |
+| --- | --- | --- |
+| `dry_run:false` 但未带 `plan_id` | 400 | `GC_PLAN_ID_REQUIRED` |
+| `plan_id` 未知/已被清理 | 404 | `GC_PLAN_UNKNOWN` |
+| 计划生成已超过一小时（TTL） | 410 | `GC_PLAN_EXPIRED` |
+| 计划已执行过（重复/并发执行） | 409 | `GC_PLAN_ALREADY_EXECUTED` |
+
+例如重复执行同一计划：
+
+```bash
+curl -i -X POST -H 'Content-Type: application/json' \
+  -d '{"dry_run": false, "plan_id": "gcplan-3a2f5c54109e42b58e0f4828485a7089"}' \
+  http://localhost:5000/gc
+# HTTP/1.1 409 Conflict
+# {"errors":[{"code":"GC_PLAN_ALREADY_EXECUTED", ...}]}
+```
+
+计划持久化在 SQLite，**重启后依然有效**（未过期即可执行）；计划是一次性的，
+由数据库中 `pending → executed` 的原子条件更新保证重复执行不会再次删除任何数据。
 
 GC 语义：
 
 - **根集合**：所有 tag 指向的 manifest；沿 `config`/`layers`/`manifests[]`/`subject`
   遍历出全部可达 blob 与 manifest。
-- **回收对象**：不可达且超出宽限期的 blob、不可达（无标签）的 manifest、
-  租约已过期的上传会话。
+- **回收对象**：计划内、执行时仍不可达且超出计划宽限期的 blob，仍不可达（无标签）
+  的 manifest，以及租约仍过期的上传会话。
+- **复核边界**：只删 dry-run 记录的候选；dry-run 之后标签移动/新推送产生的新垃圾
+  不在计划内，必须经下一次 dry-run 复核才会回收。
+- **执行时复核**：执行与生成是两个时刻——执行瞬间重新计算可达性与租约，重新可达
+  （标签回移等）或续租中的对象跳过；跳过项在响应中逐项列出。
 - **保护机制**：未过期上传租约不会被清理；宽限期内的“新 blob”不会被清理
   （覆盖“已推送 blob、尚未发布 manifest”的并发窗口）；GC 与发布/上传在同一
   写锁下串行，拉取在打开文件句柄后再流式发送，文件随后被删也不影响进行中的下载。
@@ -187,14 +300,14 @@ GC 语义：
 
 ```
 app/
-  main.py       # FastAPI 路由（/v2/*、/gc）
-  registry.py   # 核心逻辑：上传、manifest CAS、GC 可达图
-  db.py         # SQLite 元数据（WAL，进程内 RLock 串行化）
+  main.py       # FastAPI 路由（/v2/*、/gc 两阶段复核）
+  registry.py   # 核心逻辑：上传、manifest CAS、GC 可达图与持久化计划
+  db.py         # SQLite 元数据（WAL，进程内 RLock 串行化；gc_plans 持久化复核计划）
   storage.py    # 本地文件存储：blobs/sha256/<hex> 内容寻址 + uploads/<uuid>
   digest.py     # digest/tag/repo 校验与 sha256 计算
-  errors.py     # OCI 错误模型
+  errors.py     # OCI 错误模型（含 GC_PLAN_* 复核计划错误）
   config.py     # 环境变量配置
-tests/test_registry.py   # 22 个端到端测试
+tests/test_registry.py   # 30 个端到端测试
 Dockerfile / docker-compose.yml
 ```
 
@@ -206,7 +319,9 @@ pytest tests/ -q
 ```
 
 测试覆盖：分块上传与续传、摘要校验失败、幂等重试、跨仓库去重与挂载、
-manifest 引用校验、digest 不可变性、标签 CAS 冲突、GC dry-run/执行、
+manifest 引用校验、digest 不可变性、标签 CAS 冲突、GC 两阶段复核与执行、
+**dry-run 后标签移动产生的新候选不被删除**、重新可达/续租对象跳过、
+计划缺失/未知/过期/已执行拒绝、计划跨重启有效与重复执行幂等、
 宽限期与租约保护、GC 与并发拉取/发布竞争、重启后恢复上传。
 
 ## 设计说明与限制

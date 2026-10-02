@@ -89,3 +89,45 @@ def tag_conflict(repo: str, tag: str, current: "str | None", expected: "str | No
         f"re-send with header 'If-Match: <current digest>' to move the tag",
         {"repo": repo, "tag": tag, "current": current, "expected": expected},
     )
+
+
+def gc_plan_id_required() -> OCIError:
+    return OCIError(
+        400, "GC_PLAN_ID_REQUIRED",
+        "plan_id is required when dry_run is false; run a dry-run first to"
+        " review and persist the candidate set",
+    )
+
+
+def gc_plan_unknown(plan_id: str) -> OCIError:
+    return OCIError(
+        404, "GC_PLAN_UNKNOWN",
+        f"gc plan unknown or already pruned: {plan_id!r}",
+        {"plan_id": plan_id},
+    )
+
+
+def gc_plan_expired(plan_id: str) -> OCIError:
+    return OCIError(
+        410, "GC_PLAN_EXPIRED",
+        f"gc plan {plan_id!r} is older than its review window and has expired;"
+        " run a new dry-run to review again",
+        {"plan_id": plan_id},
+    )
+
+
+def gc_plan_already_executed(plan_id: str) -> OCIError:
+    return OCIError(
+        409, "GC_PLAN_ALREADY_EXECUTED",
+        f"gc plan {plan_id!r} has already been executed; plans are"
+        " one-shot and repeat execution never deletes anything again",
+        {"plan_id": plan_id},
+    )
+
+
+def gc_plan_conflict(plan_id: str) -> OCIError:
+    return OCIError(
+        409, "GC_PLAN_CONFLICT",
+        f"gc plan {plan_id!r} is already being executed by another request",
+        {"plan_id": plan_id},
+    )

@@ -11,6 +11,7 @@ class Settings:
         data_dir: "str | Path | None" = None,
         upload_lease_seconds: "int | None" = None,
         gc_grace_seconds: "int | None" = None,
+        gc_plan_ttl_seconds: "int | None" = None,
     ):
         self.data_dir = Path(
             data_dir or os.environ.get("REGISTRY_DATA_DIR", "./data")
@@ -27,6 +28,12 @@ class Settings:
             gc_grace_seconds
             if gc_grace_seconds is not None
             else os.environ.get("REGISTRY_GC_GRACE_SECONDS", "3600")
+        )
+        # GC 复核计划有效期：dry-run 生成后超过该时长未执行即作废，必须重新复核
+        self.gc_plan_ttl_seconds = int(
+            gc_plan_ttl_seconds
+            if gc_plan_ttl_seconds is not None
+            else os.environ.get("REGISTRY_GC_PLAN_TTL_SECONDS", "3600")
         )
 
     @property

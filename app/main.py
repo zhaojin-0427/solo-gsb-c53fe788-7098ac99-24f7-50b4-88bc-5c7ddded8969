@@ -32,7 +32,10 @@ def _iter_file(f, chunk_size: int = 1024 * 1024):
 
 
 class GCRequest(BaseModel):
+    # true（默认）：生成并持久化复核计划，返回 plan_id 与候选清单，不删任何数据
+    # false：凭 plan_id 执行已复核计划；计划缺失/未知/过期/已执行一律拒绝
     dry_run: bool = True
+    plan_id: Optional[str] = None
     grace_seconds: Optional[int] = None
 
 
@@ -247,7 +250,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.post("/gc")
     def gc(req: Optional[GCRequest] = Body(default=None)):
         req = req or GCRequest()
-        return registry.gc(dry_run=req.dry_run, grace_seconds=req.grace_seconds)
+        if req.dry_run:
+            # plan_id 对 dry-run 无意义（忽略）；grace_seconds 仅在生成计划时使用
+            return registry.gc_plan_create(grace_seconds=req.grace_seconds)
+        if not req.plan_id:
+            raise E.gc_plan_id_required()
+        return registry.gc_plan_execute(req.plan_id)
 
     return app
 
